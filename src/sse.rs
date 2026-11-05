@@ -2,8 +2,8 @@
 //!
 //! Text arrives as `delta.content`. Reasoning arrives as `delta.reasoning_content`
 //! and is closed into one [`StreamChunk::Reasoning`] when the span ends.
-//! Tool arguments arrive in one terminal chunk; the call is emitted once its
-//! id, name, and JSON arguments are all present. A usage object becomes
+//! Tool arguments may arrive across chunks; calls are emitted only after the
+//! server marks the argument stream complete. A usage object becomes
 //! [`StreamChunk::Final`]. `[DONE]` without a usage object still ends the
 //! stream with an empty final chunk.
 
@@ -110,6 +110,16 @@ impl SseParser {
                 };
             }
         }
+        let has_tools = !self.tools.is_empty();
+        if has_tools {
+            if let Err(err) = self.flush_tools(&mut chunks) {
+                return Feed {
+                    chunks,
+                    error: Some(err),
+                };
+            }
+            self.emit_final(&mut chunks, None);
+        }
         self.close_reasoning(&mut chunks);
         if self.saw_final {
             return Feed {
@@ -151,6 +161,7 @@ impl SseParser {
         }
         if payload == "[DONE]" {
             let mut chunks = Vec::new();
+            self.flush_tools(&mut chunks)?;
             self.close_reasoning(&mut chunks);
             self.emit_final(&mut chunks, None);
             return Ok(chunks);
@@ -202,16 +213,18 @@ impl SseParser {
                 .is_some()
             {
                 self.close_reasoning(&mut chunks);
+                self.flush_tools(&mut chunks)?;
             }
         }
         if let Some(usage) = value.get("usage").and_then(Value::as_object) {
             self.close_reasoning(&mut chunks);
+            self.flush_tools(&mut chunks)?;
             self.emit_final(&mut chunks, Some(usage_from(usage)));
         }
         Ok(chunks)
     }
 
-    fn absorb_tool(&mut self, call: &Value, chunks: &mut Vec<StreamChunk>) {
+    fn absorb_tool(&mut self, call: &Value, _chunks: &mut Vec<StreamChunk>) {
         let index = call.get("index").and_then(Value::as_u64).unwrap_or(0);
         let acc = self.tools.entry(index).or_default();
         if let Some(id) = call.get("id").and_then(Value::as_str)
@@ -227,29 +240,33 @@ impl SseParser {
         if let Some(arguments) = call.pointer("/function/arguments").and_then(Value::as_str) {
             acc.arguments.push_str(arguments);
         }
-        if self.emitted_tools.contains(&index) {
-            return;
+    }
+
+    fn flush_tools(&mut self, chunks: &mut Vec<StreamChunk>) -> Result<(), CompletionError> {
+        for (index, acc) in &self.tools {
+            if self.emitted_tools.contains(index) {
+                continue;
+            }
+            if acc.id.is_empty() || acc.name.is_empty() || acc.arguments.is_empty() {
+                return Err(stream_ended("hipfire ended an incomplete tool call"));
+            }
+            let arguments = serde_json::from_str::<Value>(&acc.arguments)
+                .map_err(|_| stream_ended("hipfire ended an incomplete tool call"))?;
+            chunks.push(StreamChunk::ToolCall(ToolCall::new(
+                acc.id.clone(),
+                acc.name.clone(),
+                arguments,
+            )));
+            self.emitted_tools.insert(*index);
         }
-        let Some(acc) = self.tools.get(&index) else {
-            return;
-        };
-        if acc.id.is_empty() || acc.name.is_empty() || acc.arguments.is_empty() {
-            return;
-        }
-        let Ok(arguments) = serde_json::from_str::<Value>(&acc.arguments) else {
-            return;
-        };
-        let id = acc.id.clone();
-        let name = acc.name.clone();
-        chunks.push(StreamChunk::ToolCall(ToolCall::new(id, name, arguments)));
-        self.emitted_tools.insert(index);
+        Ok(())
     }
 
     fn close_reasoning(&mut self, chunks: &mut Vec<StreamChunk>) {
         if self.reasoning_open {
             chunks.push(StreamChunk::Reasoning(Reasoning::new_with_signature(
                 self.reasoning.clone(),
-                None,
+                Some(String::new()),
             )));
             self.reasoning_open = false;
         }

@@ -12,7 +12,7 @@ mod sse;
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use infinity_provider_protocol::{
-    CompletionError, CompletionRequest, ModelEntry, ModelProvider, ModelStream,
+    CompletionError, CompletionRequest, ErrorClass, ModelEntry, ModelProvider, ModelStream,
 };
 use serde_json::Value;
 
@@ -74,8 +74,8 @@ impl HipfireProvider {
         let retry_after = response
             .headers()
             .contains_key(reqwest::header::RETRY_AFTER);
-        let bytes = response.bytes().await.unwrap_or_default();
-        let body = String::from_utf8_lossy(&bytes[..bytes.len().min(8192)]).into_owned();
+        let bytes = response.bytes().await?;
+        let body = String::from_utf8_lossy(&bytes).into_owned();
         Ok((status, retry_after, body))
     }
 }
@@ -87,10 +87,7 @@ fn before_first_frame() -> CompletionError {
 #[async_trait]
 impl ModelProvider for HipfireProvider {
     async fn list_models(&self) -> Result<Vec<ModelEntry>, BoxError> {
-        let (models, health) = tokio::try_join!(
-            self.get_text(&self.config.models_url),
-            self.get_text(&self.config.health_url),
-        )?;
+        let models = self.get_text(&self.config.models_url).await?;
         let (model_status, _, model_body) = models;
         if !(200..300).contains(&model_status) {
             return Err(format!("hipfire model list returned HTTP {model_status}").into());
@@ -102,28 +99,37 @@ impl ModelProvider for HipfireProvider {
             .and_then(Value::as_array)
             .ok_or("hipfire model list has no data array")?;
 
-        let (health_status, _, health_body) = health;
-        if health_status == 401 || health_status == 403 || health_status == 404 {
-            return Err(format!("hipfire health returned HTTP {health_status}").into());
-        }
-        let health: Value = if health_body.trim().is_empty() {
-            Value::Null
-        } else {
-            serde_json::from_str(&health_body)
-                .map_err(|err| format!("hipfire health was not JSON: {err}"))?
+        let health = self.get_text(&self.config.health_url).await;
+        let (resident_model, n_ctx) = match health {
+            Ok((status, _, body)) if (200..300).contains(&status) => {
+                let health: Value = serde_json::from_str(&body)
+                    .map_err(|err| format!("hipfire health was not JSON: {err}"))?;
+                let n_ctx = health
+                    .get("n_ctx")
+                    .and_then(Value::as_u64)
+                    .filter(|n_ctx| *n_ctx > 0)
+                    .and_then(|n_ctx| usize::try_from(n_ctx).ok());
+                (
+                    health
+                        .get("model")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                    n_ctx,
+                )
+            }
+            Ok((401 | 403 | 404, _, _)) => (None, None),
+            Ok((status, _, _)) => {
+                return Err(format!("hipfire health returned HTTP {status}").into());
+            }
+            Err(err) => return Err(format!("failed to read hipfire health: {err}").into()),
         };
-        let n_ctx = health
-            .get("n_ctx")
-            .and_then(Value::as_u64)
-            .filter(|n_ctx| *n_ctx > 0)
-            .and_then(|n_ctx| usize::try_from(n_ctx).ok());
 
         let mut entries = Vec::with_capacity(data.len());
         for (index, model) in data.iter().enumerate() {
             let Some(id) = model.get("id").and_then(Value::as_str) else {
                 return Err(format!("hipfire model list entry {index} is missing an id").into());
             };
-            let resident = index == 0;
+            let resident = resident_model.as_deref() == Some(id);
             let context_window = if resident {
                 n_ctx.unwrap_or(self.config.default_context_window)
             } else {
@@ -134,7 +140,7 @@ impl ModelProvider for HipfireProvider {
                 display_name: id.to_owned(),
                 context_window,
                 max_output_tokens: None,
-                supports_image_input: resident && has_image_modality(model),
+                supports_image_input: has_image_modality(model),
             });
         }
         Ok(entries)
@@ -154,13 +160,20 @@ impl ModelProvider for HipfireProvider {
             .headers()
             .contains_key(reqwest::header::RETRY_AFTER);
         if !(200..300).contains(&status) {
-            let bytes = response.bytes().await.unwrap_or_default();
-            let body = String::from_utf8_lossy(&bytes[..bytes.len().min(8192)]).into_owned();
+            let body = match response.bytes().await {
+                Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+                Err(err) => {
+                    return Err(CompletionError::provider(
+                        ErrorClass::Transient,
+                        format!("failed to read hipfire error response: {err}"),
+                    ));
+                }
+            };
             let class = classify::classify(status, retry_after, &body);
             let message = classify::public_message(status, &body);
             return Err(CompletionError::provider(class, message));
         }
-        Ok(stream_response(response))
+        Ok(stream_response(response, self.config.timeout))
     }
 }
 
@@ -175,13 +188,27 @@ fn has_image_modality(model: &Value) -> bool {
         })
 }
 
-fn stream_response(response: reqwest::Response) -> ModelStream {
+fn stream_response(response: reqwest::Response, idle_timeout: std::time::Duration) -> ModelStream {
     Box::pin(async_stream::stream! {
         let mut parser = sse::SseParser::new();
         let mut incoming = Box::pin(response.bytes_stream());
-        while let Some(item) = incoming.next().await {
+        let mut body_started = false;
+        loop {
+            let next = if body_started {
+                match tokio::time::timeout(idle_timeout, incoming.next()).await {
+                    Ok(next) => next,
+                    Err(_) => {
+                        yield Err(CompletionError::ResponseError("hipfire stream stalled after response bytes".to_owned()));
+                        return;
+                    }
+                }
+            } else {
+                incoming.next().await
+            };
+            let Some(item) = next else { break };
             match item {
                 Ok(bytes) => {
+                    body_started = true;
                     let feed = parser.push(&bytes);
                     for chunk in feed.chunks {
                         yield Ok(chunk);

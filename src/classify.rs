@@ -22,18 +22,18 @@ const DAEMON_CLASSES: &[&str] = &[
     "internal",
     "adaptive_poison",
     "deterministic_mismatch",
+    "throttled",
 ];
 
 pub(crate) fn classify(status: u16, retry_after: bool, body: &str) -> ErrorClass {
-    if let Some(class) = daemon_class(body) {
-        return class_to_error(&class);
+    if let Some((class, retryable)) = daemon_class(body) {
+        return class_to_error(&class, retryable);
     }
-    if status == 401 || status == 404 || status == 413 {
-        ErrorClass::Fatal
-    } else if status == 503 && retry_after {
-        ErrorClass::Transient
-    } else {
-        ErrorClass::Fatal
+    match status {
+        429 => ErrorClass::Throttled,
+        408 | 502 | 504 => ErrorClass::Transient,
+        503 if retry_after => ErrorClass::Transient,
+        _ => ErrorClass::Fatal,
     }
 }
 
@@ -44,34 +44,36 @@ pub(crate) fn public_message(status: u16, body: &str) -> String {
     format!("hipfire returned HTTP {status}")
 }
 
-fn class_to_error(class: &str) -> ErrorClass {
+fn class_to_error(class: &str, retryable: bool) -> ErrorClass {
     if class == "context_length" {
         ErrorClass::ContextOverflow
-    } else if class == "transient" || class == "overload" {
+    } else if class == "throttled" {
+        ErrorClass::Throttled
+    } else if class == "transient" || class == "overload" || retryable {
         ErrorClass::Transient
     } else {
         ErrorClass::Fatal
     }
 }
 
-fn daemon_class(body: &str) -> Option<String> {
+fn daemon_class(body: &str) -> Option<(String, bool)> {
     let value: Value = serde_json::from_str(body).ok()?;
     let error = value.get("error")?;
     if let Some(class) = error.get("class").and_then(Value::as_str)
         && is_daemon_class(class)
     {
-        return Some(class.to_owned());
+        return Some((class.to_owned(), false));
     }
     if let Some(class) = error.get("type").and_then(Value::as_str)
         && is_daemon_class(class)
     {
-        return Some(class.to_owned());
+        return Some((class.to_owned(), false));
     }
     let message = error.get("message").and_then(Value::as_str)?;
-    rendered_daemon_class(message).map(str::to_owned)
+    rendered_daemon_class(message).map(|(class, retryable)| (class.to_owned(), retryable))
 }
 
-fn rendered_daemon_class(message: &str) -> Option<&str> {
+fn rendered_daemon_class(message: &str) -> Option<(&str, bool)> {
     let trimmed = message.trim_start();
     let trimmed = match trimmed.strip_prefix("daemon error:") {
         Some(rest) => rest.trim_start(),
@@ -80,12 +82,9 @@ fn rendered_daemon_class(message: &str) -> Option<&str> {
     let inside = trimmed.strip_prefix('[')?.split_once(']')?.0;
     let mut words = inside.split_whitespace();
     let class = words.next()?;
-    let marker = words.next()?;
-    if !marker.starts_with("retryable=") {
-        return None;
-    }
+    let retryable = words.find_map(|word| word.strip_prefix("retryable="))? == "true";
     if is_daemon_class(class) {
-        Some(class)
+        Some((class, retryable))
     } else {
         None
     }

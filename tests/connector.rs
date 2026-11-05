@@ -69,7 +69,60 @@ async fn resident_image_modality_does_not_apply_to_other_models() {
     assert!(models[0].supports_image_input);
     assert_eq!(models[1].model_id, "other:1");
     assert_eq!(models[1].context_window, 4096);
-    assert!(!models[1].supports_image_input);
+    assert!(models[1].supports_image_input);
+}
+
+#[tokio::test]
+async fn model_list_larger_than_8192_bytes_is_parsed_completely() {
+    let mut body = models_body(&["first", "resident"], &["text"]);
+    body["data"][0]["metadata"] = json!("x".repeat(9000));
+    let mut health = health_body(12345);
+    health["model"] = json!("resident");
+    let double = Double::start(routes(&[
+        ("GET /v1/models", json_reply(200, &[], body)),
+        ("GET /health", json_reply(200, &[], health)),
+    ]))
+    .await;
+    let models = provider(&double, false, 5, 111)
+        .list_models()
+        .await
+        .unwrap();
+    assert_eq!(models[1].context_window, 12345);
+}
+
+#[tokio::test]
+async fn unreadable_health_body_is_an_error() {
+    let double = Double::start(routes(&[
+        (
+            "GET /v1/models",
+            json_reply(200, &[], models_body(&["resident"], &["text"])),
+        ),
+        ("GET /health", Reply::short_body(200, b"{\"n_ctx\":8192}")),
+    ]))
+    .await;
+    assert!(
+        provider(&double, false, 5, 111)
+            .list_models()
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn health_404_keeps_models_available_with_configured_fallback() {
+    let double = Double::start(routes(&[
+        (
+            "GET /v1/models",
+            json_reply(200, &[], models_body(&["resident"], &["text"])),
+        ),
+        ("GET /health", json_reply(404, &[], json!({}))),
+    ]))
+    .await;
+    let models = provider(&double, false, 5, 111)
+        .list_models()
+        .await
+        .unwrap();
+    assert_eq!(models[0].context_window, 111);
 }
 
 #[tokio::test]
@@ -81,7 +134,7 @@ async fn text_stream_requests_thinking_off_and_ends_in_usage() {
         "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":2,\"total_tokens\":5,\"prompt_tokens_details\":{\"cached_tokens\":1}}}\n\n",
         "data: [DONE]\n\n",
     );
-    let double = Double::start(routes(&[("POST /v1/chat/completions", sse_reply(sse))])).await;
+    let double = Double::start(routes(&[("POST /v1/chat/completions", sse_reply(&sse))])).await;
     let provider = provider(&double, false, 5, 8192);
     let stream = provider
         .invoke_model(
@@ -131,7 +184,7 @@ async fn reasoning_only_stream_closes_one_reasoning_block() {
         "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\" two\"},\"finish_reason\":\"length\"}]}\n\n",
         "data: [DONE]\n\n",
     );
-    let double = Double::start(routes(&[("POST /v1/chat/completions", sse_reply(sse))])).await;
+    let double = Double::start(routes(&[("POST /v1/chat/completions", sse_reply(&sse))])).await;
     let stream = provider(&double, true, 5, 8192)
         .invoke_model("qwen3.5:9b", sample_request(None))
         .await
@@ -148,12 +201,44 @@ async fn reasoning_only_stream_closes_one_reasoning_block() {
                 id: None,
                 text: " two".into(),
             },
-            StreamChunk::Reasoning(Reasoning::new_with_signature("step two", None)),
+            StreamChunk::Reasoning(Reasoning::new_with_signature(
+                "step two",
+                Some(String::new()),
+            )),
             StreamChunk::Final(FinalResponse { usage: None }),
         ],
     );
     let body = recorded_json(&double, "POST /v1/chat/completions");
     assert_eq!(body["chat_template_kwargs"]["enable_thinking"], true);
+}
+
+#[tokio::test]
+async fn closed_reasoning_with_empty_ignored_signature_is_replayed() {
+    let sse = "data: [DONE]\n\n";
+    let double = Double::start(routes(&[("POST /v1/chat/completions", sse_reply(sse))])).await;
+    let mut request = sample_request(None);
+    request.chat_history.insert(
+        1,
+        Message::Assistant {
+            content: vec![AssistantContent::Reasoning(Reasoning::new_with_signature(
+                "keep this reasoning",
+                Some(String::new()),
+            ))],
+        },
+    );
+    let stream = provider(&double, true, 5, 8192)
+        .invoke_model("qwen3.5:9b", request)
+        .await
+        .unwrap();
+    assert_ok(
+        &collect(stream).await,
+        &[StreamChunk::Final(FinalResponse { usage: None })],
+    );
+    let body = recorded_json(&double, "POST /v1/chat/completions");
+    assert_eq!(
+        body["messages"][2]["reasoning_content"],
+        "keep this reasoning"
+    );
 }
 
 #[tokio::test]
@@ -164,7 +249,7 @@ async fn one_terminal_tool_call_chunk_becomes_a_tool_call() {
         "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":3,\"total_tokens\":5}}\n\n",
         "data: [DONE]\n\n",
     );
-    let double = Double::start(routes(&[("POST /v1/chat/completions", sse_reply(sse))])).await;
+    let double = Double::start(routes(&[("POST /v1/chat/completions", sse_reply(&sse))])).await;
     let stream = provider(&double, false, 5, 8192)
         .invoke_model("qwen3.5:9b", sample_request(None))
         .await
@@ -198,6 +283,104 @@ async fn one_terminal_tool_call_chunk_becomes_a_tool_call() {
     assert_eq!(body["messages"][3]["role"], "tool");
     assert_eq!(body["messages"][3]["tool_call_id"], "call-prev");
     assert_eq!(body["messages"][3]["content"], "rain");
+}
+
+#[tokio::test]
+async fn tool_arguments_are_combined_until_the_terminal_boundary() {
+    let first = json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c","function":{"name":"f","arguments":"{\"url\":\"https://github.com/org/repo"}}]}}]});
+    let second = json!({"choices":[{
+        "delta":{"tool_calls":[{"index":0,"function":{"arguments":"\",\"branch\":\"main\"}"}}]},
+        "finish_reason":"tool_calls"
+    }]});
+    let sse = format!("data: {first}\n\ndata: {second}\n\n");
+    let double = Double::start(routes(&[("POST /v1/chat/completions", sse_reply(&sse))])).await;
+    let chunks = collect(
+        provider(&double, false, 5, 8192)
+            .invoke_model("m", sample_request(None))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_ok(
+        &chunks,
+        &[
+            StreamChunk::ToolCall(ToolCall::new(
+                "c",
+                "f",
+                json!({"url":"https://github.com/org/repo","branch":"main"}),
+            )),
+            StreamChunk::Final(FinalResponse { usage: None }),
+        ],
+    );
+}
+
+#[tokio::test]
+async fn valid_json_prefix_is_not_emitted_before_arguments_finish() {
+    let first = json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c","function":{"name":"f","arguments":"1"}}]}}]});
+    let second = json!({"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"2"}}]},"finish_reason":"tool_calls"}]});
+    let sse = format!("data: {first}\n\ndata: {second}\n\n");
+    let double = Double::start(routes(&[("POST /v1/chat/completions", sse_reply(&sse))])).await;
+    let chunks = collect(
+        provider(&double, false, 5, 8192)
+            .invoke_model("m", sample_request(None))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_ok(
+        &chunks,
+        &[
+            StreamChunk::ToolCall(ToolCall::new("c", "f", json!(12))),
+            StreamChunk::Final(FinalResponse { usage: None }),
+        ],
+    );
+}
+
+#[tokio::test]
+async fn complete_tool_call_at_eof_is_final_and_incomplete_call_errors() {
+    let complete = "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c\",\"function\":{\"name\":\"f\",\"arguments\":\"{}\"}}]}}]}\n\n";
+    let double = Double::start(routes(&[(
+        "POST /v1/chat/completions",
+        sse_reply(complete),
+    )]))
+    .await;
+    let chunks = collect(
+        provider(&double, false, 5, 8192)
+            .invoke_model("m", sample_request(None))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_ok(
+        &chunks,
+        &[
+            StreamChunk::ToolCall(ToolCall::new("c", "f", json!({}))),
+            StreamChunk::Final(FinalResponse { usage: None }),
+        ],
+    );
+
+    let incomplete = "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c\",\"function\":{\"name\":\"f\",\"arguments\":\"{\\\"x\\\":\"}}]}}]}\n\n";
+    let double = Double::start(routes(&[(
+        "POST /v1/chat/completions",
+        sse_reply(incomplete),
+    )]))
+    .await;
+    let chunks = collect(
+        provider(&double, false, 5, 8192)
+            .invoke_model("m", sample_request(None))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert!(
+        chunks
+            .last()
+            .unwrap()
+            .as_ref()
+            .unwrap_err()
+            .to_string()
+            .contains("incomplete tool call")
+    );
 }
 
 #[tokio::test]
@@ -264,6 +447,42 @@ async fn busy_queue_with_retry_after_is_transient() {
 }
 
 #[tokio::test]
+async fn retryable_daemon_classes_and_throttle_status_keep_their_class() {
+    let body = json!({"error":{"message":"daemon error: [internal retryable=true] backend failed","type":"server_error"}});
+    assert_eq!(
+        http_error(500, &[], &body).await.class(),
+        ErrorClass::Transient
+    );
+    for status in [408, 502, 504] {
+        assert_eq!(
+            http_error(status, &[], &json!({})).await.class(),
+            ErrorClass::Transient
+        );
+    }
+    assert_eq!(
+        http_error(429, &[], &json!({})).await.class(),
+        ErrorClass::Throttled
+    );
+}
+
+#[tokio::test]
+async fn truncated_error_body_does_not_erase_context_class() {
+    let mut body = json!({"error":{"message":"too long","type":"context_length"}});
+    body["padding"] = json!("x".repeat(9000));
+    let double = Double::start(routes(&[(
+        "POST /v1/chat/completions",
+        json_reply(400, &[], body),
+    )]))
+    .await;
+    let err = expect_err(
+        provider(&double, false, 5, 8192)
+            .invoke_model("m", sample_request(None))
+            .await,
+    );
+    assert_eq!(err.class(), ErrorClass::ContextOverflow);
+}
+
+#[tokio::test]
 async fn typed_transient_and_named_fatal_statuses() {
     let transient = json!({"error": {"message": "try again", "type": "transient"}});
     assert_eq!(
@@ -304,7 +523,7 @@ async fn timeout_before_the_first_frame_is_transient() {
 #[tokio::test]
 async fn a_stream_that_ends_after_bytes_is_transient() {
     let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"Hi\"}}]}\n\n";
-    let double = Double::start(routes(&[("POST /v1/chat/completions", sse_reply(sse))])).await;
+    let double = Double::start(routes(&[("POST /v1/chat/completions", sse_reply(&sse))])).await;
     let stream = provider(&double, false, 5, 8192)
         .invoke_model("qwen3.5:9b", sample_request(None))
         .await
@@ -319,12 +538,34 @@ async fn a_stream_that_ends_after_bytes_is_transient() {
 }
 
 #[tokio::test]
+async fn body_stall_after_stream_bytes_is_transient() {
+    let bytes = b"data: {\"choices\":[{\"delta\":{\"content\":\"Hi\"}}]}\n\n";
+    let double = Double::start(routes(&[(
+        "POST /v1/chat/completions",
+        Reply::partial_stream(bytes),
+    )]))
+    .await;
+    let chunks = collect(
+        provider(&double, false, 1, 8192)
+            .invoke_model("m", sample_request(None))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert!(matches!(chunks.first(), Some(Ok(StreamChunk::Text(text))) if text == "Hi"));
+    assert_eq!(
+        chunks.last().unwrap().as_ref().unwrap_err().class(),
+        ErrorClass::Transient
+    );
+}
+
+#[tokio::test]
 async fn a_mid_stream_context_length_keeps_its_class() {
     let sse = concat!(
         "data: {\"choices\":[{\"delta\":{\"content\":\"Hi\"}}]}\n\n",
         "data: {\"error\":{\"message\":\"the prompt does not fit\",\"type\":\"context_length\"}}\n\n",
     );
-    let double = Double::start(routes(&[("POST /v1/chat/completions", sse_reply(sse))])).await;
+    let double = Double::start(routes(&[("POST /v1/chat/completions", sse_reply(&sse))])).await;
     let stream = provider(&double, false, 5, 8192)
         .invoke_model("qwen3.5:9b", sample_request(None))
         .await
@@ -528,6 +769,8 @@ fn json_reply(status: u16, headers: &[(&str, &str)], body: Value) -> Reply {
             .collect(),
         body: serde_json::to_vec(&body).unwrap(),
         hang: false,
+        declared_length: None,
+        hang_after_body: false,
     }
 }
 
@@ -537,6 +780,8 @@ fn sse_reply(body: &str) -> Reply {
         headers: vec![("content-type".into(), "text/event-stream".into())],
         body: body.as_bytes().to_vec(),
         hang: false,
+        declared_length: None,
+        hang_after_body: false,
     }
 }
 
@@ -546,6 +791,8 @@ struct Reply {
     headers: Vec<(String, String)>,
     body: Vec<u8>,
     hang: bool,
+    declared_length: Option<usize>,
+    hang_after_body: bool,
 }
 
 impl Reply {
@@ -555,6 +802,30 @@ impl Reply {
             headers: Vec::new(),
             body: Vec::new(),
             hang: true,
+            declared_length: None,
+            hang_after_body: false,
+        }
+    }
+
+    fn short_body(status: u16, body: &[u8]) -> Self {
+        Self {
+            status,
+            headers: Vec::new(),
+            body: body.to_vec(),
+            hang: false,
+            declared_length: Some(body.len() + 20),
+            hang_after_body: false,
+        }
+    }
+
+    fn partial_stream(body: &[u8]) -> Self {
+        Self {
+            status: 200,
+            headers: vec![("content-type".into(), "text/event-stream".into())],
+            body: body.to_vec(),
+            hang: false,
+            declared_length: Some(body.len() + 20),
+            hang_after_body: true,
         }
     }
 }
@@ -679,7 +950,7 @@ async fn handle(
         "HTTP/1.1 {} {}\r\nContent-Length: {}\r\nConnection: close\r\n",
         reply.status,
         reason(reply.status),
-        reply.body.len()
+        reply.declared_length.unwrap_or(reply.body.len())
     );
     for (name, value) in &reply.headers {
         head.push_str(name);
@@ -690,6 +961,9 @@ async fn handle(
     head.push_str("\r\n");
     socket.write_all(head.as_bytes()).await?;
     socket.write_all(&reply.body).await?;
+    if reply.hang_after_body {
+        std::future::pending::<()>().await;
+    }
     Ok(())
 }
 
