@@ -22,7 +22,13 @@ async fn main() -> Result<(), BoxError> {
         .with_ansi(false)
         .init();
 
-    let provider = Arc::new(HipfireProvider::from_env());
+    let provider = match HipfireProvider::from_env() {
+        Ok(provider) => Arc::new(provider),
+        Err(err) => {
+            eprintln!("{err}");
+            std::process::exit(1);
+        }
+    };
     let (socket_path, server) = serve_provider(provider)?;
 
     println!("{}", socket_path.display());

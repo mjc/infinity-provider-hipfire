@@ -8,9 +8,20 @@ license = "Apache-2.0"
 publish = false
 
 [dependencies]
+async-stream = "0.3"
 async-trait = "0.1"
+futures-util = "0.3"
 # Tag infinity-provider-protocol-v0.2.0 in hydro-project/infinity.
 infinity-provider-protocol = { version = "0.2.0", git = "https://github.com/hydro-project/infinity", rev = "97c2f06ea4715bd62577a0f25182aab88a54e76b", features = ["remote"] }
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "stream"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+url = "2"
+
+[dev-dependencies]
+futures-util = "0.3"
+infinity-provider-protocol = { version = "0.2.0", git = "https://github.com/hydro-project/infinity", rev = "97c2f06ea4715bd62577a0f25182aab88a54e76b" }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "io-util", "time", "sync"] }
