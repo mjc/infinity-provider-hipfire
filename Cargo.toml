@@ -1,0 +1,14 @@
+[package]
+name = "infinity-provider-hipfire"
+version = "0.1.0"
+edition = "2024"
+description = "Hipfire model provider for Infinity agents."
+license = "Apache-2.0"
+publish = false
+
+[dependencies]
+async-trait = "0.1"
+infinity-provider-protocol = { version = "0.2.0", features = ["remote"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
