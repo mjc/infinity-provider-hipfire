@@ -9,7 +9,8 @@ publish = false
 
 [dependencies]
 async-trait = "0.1"
-infinity-provider-protocol = { version = "0.2.0", features = ["remote"] }
+# Tag infinity-provider-protocol-v0.2.0 in hydro-project/infinity.
+infinity-provider-protocol = { version = "0.2.0", git = "https://github.com/hydro-project/infinity", rev = "97c2f06ea4715bd62577a0f25182aab88a54e76b", features = ["remote"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

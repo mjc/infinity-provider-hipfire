@@ -130,8 +130,7 @@ dependencies = [
 [[package]]
 name = "infinity-provider-protocol"
 version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5807edbe418e65cbca134424c18854030ce265a13399175fde372713422ddd32"
+source = "git+https://github.com/hydro-project/infinity?rev=97c2f06ea4715bd62577a0f25182aab88a54e76b#97c2f06ea4715bd62577a0f25182aab88a54e76b"
 dependencies = [
  "async-stream",
  "async-trait",
